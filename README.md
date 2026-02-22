@@ -2,6 +2,14 @@
 
 A specialized bot designed to identify profitable betting opportunities in Polymarket's weather markets. It leverages real-time weather forecasts and compares them with market probabilities to calculate Expected Value (EV) and recommend Long/Short positions or blanket strategies.
 
+## About
+
+This project is an algorithmic trading bot that specializes in identifying arbitrage opportunities in Polymarket's prediction markets, specifically focusing on weather-related events. The bot combines financial modeling, statistical analysis, and real-time data integration to find mispriced markets where the market's implied probability differs from the true probability based on weather forecasts.
+
+The core innovation lies in using accurate weather forecasting data to calculate the true probability of temperature outcomes, then comparing these probabilities against market prices to find positive expected value bets. The system supports both individual position recommendations and portfolio-level strategies using the Kelly Criterion for optimal bet sizing.
+
+Built with Python, the bot integrates with Polymarket's Gamma API for market data and Open-Meteo API for weather forecasts, providing a complete automated solution for weather market arbitrage.
+
 ## Features
 
 - **Real-time Market Scanning**: Fetches active weather events from Polymarket (Gamma API).
@@ -81,6 +89,19 @@ python main.py --demo
     - Calculates the probability of each temperature bucket (e.g., "< 40F", "40-50F") using a Normal Distribution centered on the forecast.
     - Compares "True Prob" vs. "Market Price".
 5.  **Recommend**: Outputs bets where `EV > 0`.
+
+## Topics
+
+- **Arbitrage Trading**: Identifying and exploiting price discrepancies in prediction markets
+- **Weather Forecasting**: Integration with meteorological APIs for accurate temperature predictions
+- **Expected Value (EV) Calculation**: Mathematical modeling to determine profitable betting opportunities
+- **Portfolio Optimization**: Kelly Criterion and risk management for bet sizing
+- **Prediction Markets**: Polymarket integration and market analysis
+- **Statistical Modeling**: Normal distribution and probability calculations
+- **API Integration**: Real-time data fetching from multiple sources
+- **Python Automation**: Automated trading bot development
+- **Financial Analysis**: Market probability vs. true probability comparison
+- **Risk Management**: Portfolio-level analysis and position sizing
 
 ## Disclaimer
 
