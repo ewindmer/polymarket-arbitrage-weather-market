@@ -1,4 +1,4 @@
-# Polymarket Weather Arbitrage Bot
+# Polymarket Arbitrage Bot Weather Market
 
 A specialized bot designed to identify profitable betting opportunities in Polymarket's weather markets. It leverages real-time weather forecasts and compares them with market probabilities to calculate Expected Value (EV) and recommend Long/Short positions or blanket strategies.
 
