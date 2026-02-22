@@ -3,15 +3,22 @@ from datetime import datetime
 import statistics
 import math
 import json
+import logging
+from typing import Dict, Optional, Tuple, List, Any
 
-# Standard deviation of forecast error in degrees Celsius
-# Benchmark (Jan 2026) showed observed StdDev of ~1.1C.
-# We use 1.5C to be safe but more accurate than the default 2.0C.
-FORECAST_STD_DEV_C = 1.5
+import config
 
-def parse_event_title(title):
+logger = logging.getLogger(__name__)
+
+def parse_event_title(title: str) -> Optional[Dict[str, str]]:
     """
     Parses "Highest temperature in {City} on {Date}?"
+    
+    Args:
+        title: Event title string
+        
+    Returns:
+        Dictionary with 'city' and 'date' keys, or None if parsing fails
     """
     # Title: "Highest temperature in NYC on January 14?"
     # Regex to find City and Date
@@ -23,12 +30,7 @@ def parse_event_title(title):
     date_str = match.group(2).strip()
     
     # Clean city name if needed
-    # Map common abbr
-    city_map = {
-        "NYC": "New York",
-        "LA": "Los Angeles"
-    }
-    city = city_map.get(city_str, city_str)
+    city = config.CITY_MAP.get(city_str, city_str)
     
     # Parse Date
     # "January 14" -> Need to add year. Assume current or next.
@@ -37,7 +39,8 @@ def parse_event_title(title):
         dt = datetime.strptime(f"{date_str} {now.year}", "%B %d %Y")
         # If date is in past more than a day, maybe it's next year? 
         # But usually these are daily markets. simpler to assume current year.
-    except:
+    except ValueError as e:
+        logger.debug(f"Failed to parse date '{date_str}': {e}")
         return None
         
     return {
@@ -45,13 +48,19 @@ def parse_event_title(title):
         "date": dt.strftime("%Y-%m-%d")
     }
 
-def parse_bucket_question(question):
+def parse_bucket_question(question: str) -> Optional[Dict[str, Any]]:
     """
     Parses specific market question to get range.
     Examples:
     - "... be 41°F or below ..." -> (-inf, 41)
     - "... be between 42-43°F ..." -> [42, 43]
     - "... be 52°F or higher ..." -> (52, inf)
+    
+    Args:
+        question: Market question string
+        
+    Returns:
+        Dictionary with 'min', 'max', and 'unit' keys, or None if parsing fails
     """
     # Unit check
     unit = "F" if "°F" in question or "F" in question else "C"
@@ -77,16 +86,32 @@ def parse_bucket_question(question):
         
     return None
 
-def to_celsius(val, unit):
+def to_celsius(val: float, unit: str) -> float:
+    """Convert temperature to Celsius."""
     if unit == "C":
         return val
     return (val - 32) * 5/9
 
-def calculate_probability_range(forecast_val, min_c, max_c, std_dev=FORECAST_STD_DEV_C):
+def calculate_probability_range(
+    forecast_val: float, 
+    min_c: float, 
+    max_c: float, 
+    std_dev: float = config.FORECAST_STD_DEV_C
+) -> float:
     """
+    Calculate probability that temperature falls within range using normal distribution.
     P(min < X < max) = CDF(max) - CDF(min)
+    
+    Args:
+        forecast_val: Forecasted temperature (mean) in Celsius
+        min_c: Minimum temperature in Celsius
+        max_c: Maximum temperature in Celsius
+        std_dev: Standard deviation in Celsius
+        
+    Returns:
+        Probability (0.0 to 1.0)
     """
-    def cdf(x):
+    def cdf(x: float) -> float:
         return 0.5 * (1 + math.erf((x - forecast_val) / (std_dev * math.sqrt(2))))
     
     p_max = cdf(max_c)
@@ -94,9 +119,59 @@ def calculate_probability_range(forecast_val, min_c, max_c, std_dev=FORECAST_STD
     
     return p_max - p_min
 
-def calculate_ev_for_event(event, forecast_max, forecast_min):
+def get_market_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     """
-    Analyzes all markets in the event.
+    Extract buy prices for YES and NO outcomes from market data.
+    
+    Prefers bestAsk/bestBid for accurate pricing, falls back to outcomePrices.
+    
+    Args:
+        market: Market dictionary from Polymarket API
+        
+    Returns:
+        Tuple of (price_buy_yes, price_buy_no) or (None, None) if unavailable
+    """
+    price_buy_yes = None
+    price_buy_no = None
+    
+    # Try to get bestAsk/bestBid first (most accurate)
+    if "bestAsk" in market and "bestBid" in market:
+        try:
+            price_buy_yes = float(market["bestAsk"])
+            best_bid_yes = float(market["bestBid"])
+            # Cost to Buy No = 1.0 - bestBid (since Yes + No = 1.0)
+            price_buy_no = 1.0 - best_bid_yes
+            return price_buy_yes, price_buy_no
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Failed to parse bestAsk/bestBid: {e}")
+    
+    # Fallback to outcomePrices (less accurate, mid prices)
+    try:
+        outcomes = json.loads(market.get("outcomes", "[]"))
+        outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+        yes_idx = outcomes.index("Yes")
+        price_buy_yes = float(outcome_prices[yes_idx])
+        price_buy_no = 1.0 - price_buy_yes
+        return price_buy_yes, price_buy_no
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
+        logger.debug(f"Failed to parse outcomePrices: {e}")
+        return None, None
+
+def calculate_ev_for_event(
+    event: Dict[str, Any], 
+    forecast_max: float, 
+    forecast_min: float
+) -> Dict[str, Any]:
+    """
+    Analyzes all markets in the event and calculates EV for long, short, and blanket strategies.
+    
+    Args:
+        event: Event dictionary with 'title' and 'markets' keys
+        forecast_max: Forecasted maximum temperature in Celsius
+        forecast_min: Forecasted minimum temperature in Celsius
+        
+    Returns:
+        Dictionary with 'bets' (longs), 'shorts', and 'strategy' (blanket) keys
     """
     event_title = event.get("title", "")
     markets = event.get("markets", [])
@@ -118,73 +193,17 @@ def calculate_ev_for_event(event, forecast_max, forecast_min):
         # "Highest temperature" implies we check against forecast_max
         true_prob = calculate_probability_range(forecast_max, min_c, max_c)
         
-        # Get Price
-        # Use bestAsk for BUYING YES
-        # Use bestBid for SELLING YES (which is effectively Buying NO, wait...)
-        # Polymarket "Buy Yes" price is the `bestAsk` for Yes outcome.
-        # Polymarket "Buy No" price is ... implied by `bestBid` of Yes?
-        # Actually Gamma returns `bestAsk` and `bestBid`.
+        # Get prices using helper function
+        price_buy_yes, price_buy_no = get_market_prices(market)
         
-        # Structure of Gamma Market:
-        # bestAsk: price to BUY YES immediately.
-        # bestBid: price to SELL YES immediately.
-        
-        # If we want to "Bet YES", we buy at `bestAsk`.
-        # If we want to "Bet NO" (Short), we effectively "Buy No". 
-        # In Polymarket UI, "Buy No" takes liquidity from the YES SIDES?
-        # "Buy No" @ 0.73 means you pay 0.73.
-        # This is equivalent to Selling Yes @ 0.27?
-        # If I Sell Yes @ 0.27, I put up 0.27 collateral? No.
-        # If I Sell Yes @ 0.27, I get 0.27?
-        # Let's stick to the UI perspective.
-        # Gamma also provides `bestAsk` and `bestBid` for the "No" outcome? 
-        # No, typically usually only one token (YES).
-        
-        # Actually, Gamma `bestAsk` is the cheapest price to BUY 1 outcome token.
-        # `outcomePrices` was the mid.
-        
-        # We need to rely on `bestAsk` field if available.
-        
-        price_buy_yes = None
-        price_buy_no = None
-        
-        # Check if we have bestAsk/Bid
-        if "bestAsk" in market and "bestBid" in market:
-              try:
-                  price_buy_yes = float(market["bestAsk"])
-                  # To Buy NO, we are effectively hitting the BID of YES?
-                  # Buying NO at $0.74 means Selling YES at $0.26? 
-                  # Yes + No = 1.
-                  # Buy No Price = 1 - Sell Yes Price (bestBid).
-                  # Example: bestBid (Sell Yes) is 0.40. You can sell your Yes for 0.40.
-                  # Or someone else sells Yes for 0.40.
-                  # If I want to Buy No, I match against someone buying Yes?
-                  # Yes. BestBid is the highest price someone acts to BUY Yes.
-                  # If I "Buy No", I am satisfying their Buy Yes order.
-                  # So Cost to Buy No = 1.0 - bestBid.
-                  
-                  best_bid_yes = float(market["bestBid"])
-                  price_buy_no = 1.0 - best_bid_yes
-              except:
-                  pass
-                  
-        # Fallback to unreliable outcomePrices if detailed data failed
         if price_buy_yes is None:
-             outcomes = json.loads(market.get("outcomes", "[]"))
-             outcome_prices = json.loads(market.get("outcomePrices", "[]"))
-             try:
-                 yes_idx = outcomes.index("Yes")
-                 # Fallback, highly inaccurate for illiquid markets
-                 price_buy_yes = float(outcome_prices[yes_idx])
-                 price_buy_no = 1.0 - price_buy_yes 
-             except:
-                 continue
+            continue
 
         # --- VALIDATION FOR LONG (BET YES) ---
         # We pay `price_buy_yes`
         if price_buy_yes > 0:
             ev_long = true_prob - price_buy_yes
-            if ev_long > 0.05:
+            if ev_long > config.EV_THRESHOLD_LONG:
                 recommendations.append({
                     "market_question": question,
                     "bucket": f"{bucket['min']} to {bucket['max']} {bucket['unit']}",
@@ -211,28 +230,17 @@ def calculate_ev_for_event(event, forecast_max, forecast_min):
         min_c = to_celsius(bucket["min"], bucket["unit"])
         max_c = to_celsius(bucket["max"], bucket["unit"])
         
-        lower_bound = forecast_max - (1.5 * FORECAST_STD_DEV_C)
-        upper_bound = forecast_max + (1.5 * FORECAST_STD_DEV_C)
+        lower_bound = forecast_max - (1.5 * config.FORECAST_STD_DEV_C)
+        upper_bound = forecast_max + (1.5 * config.FORECAST_STD_DEV_C)
         
         if (min_c < upper_bound) and (max_c > lower_bound):
             prob = calculate_probability_range(forecast_max, min_c, max_c)
             
-            # Re-fetch price logic for blanket (Buying Yes)
-            price = None
-            if "bestAsk" in market:
-                try: price = float(market["bestAsk"])
-                except: pass
-                
-            if price is None:
-                # Fallback
-                outcomes = json.loads(market.get("outcomes", "[]"))
-                outcome_prices = json.loads(market.get("outcomePrices", "[]"))
-                try:
-                    yes_idx = outcomes.index("Yes")
-                    price = float(outcome_prices[yes_idx])
-                except: continue
-
-            if price <= 0: continue
+            # Get price using helper function
+            price, _ = get_market_prices(market)
+            
+            if price is None or price <= 0:
+                continue
                 
             coverage_candidates.append({
                 "bucket": f"{bucket['min']} to {bucket['max']} {bucket['unit']}",
@@ -252,7 +260,7 @@ def calculate_ev_for_event(event, forecast_max, forecast_min):
         total_prob = sum(c['prob'] for c in coverage_candidates)
         total_ev = sum(c['ev'] for c in coverage_candidates)
         
-        if total_ev > 0.05:
+        if total_ev > config.EV_THRESHOLD_STRATEGY:
             if total_cost > 0:
                 roi = (total_ev / total_cost) * 100
                 roi_str = f"{roi:.1f}%"
@@ -284,37 +292,25 @@ def calculate_ev_for_event(event, forecast_max, forecast_min):
          true_prob_yes = calculate_probability_range(forecast_max, min_c, max_c)
          true_prob_no = 1.0 - true_prob_yes
          
-         # Price to Buy No = 1 - bestBid (Sell Yes)
-         price_buy_no = None
-         implied_yes_price = None
+         # Get prices using helper function
+         price_buy_yes, price_buy_no = get_market_prices(market)
          
+         # For shorts, we need bestBid to calculate accurate price_buy_no
+         # If we only have fallback data (outcomePrices), skip shorts for safety
+         if price_buy_no is None:
+             # Skip if we don't have real bid liquidity
+             if "bestBid" not in market:
+                 continue
+             # If we got here, get_market_prices failed - skip
+             continue
+         
+         # Calculate implied_yes_price from bestBid if available
+         implied_yes_price = None
          if "bestBid" in market:
              try:
-                 bid = float(market["bestBid"])
-                 if bid > 0: 
-                    price_buy_no = 1.0 - bid
-                    implied_yes_price = bid
-             except: pass
-         
-         # Fallback
-         if price_buy_no is None:
-             outcomes = json.loads(market.get("outcomes", "[]"))
-             outcome_prices = json.loads(market.get("outcomePrices", "[]"))
-             try:
-                 yes_price_mid = float(outcome_prices[outcomes.index("Yes")])
-                 # Mid price is a terrible proxy for Bid if spread is wide.
-                 # Conservatively assume spread is big for fallback? 
-                 # Or just skip if no real bid?
-                 # If we rely on fallback, we prompt the user with bad data.
-                 # BETTER: Skip shorts if we don't have real bid liquidity.
-                 if not "bestBid" in market:
-                     # print(f"Skipping short since no bestBid for {bucket}")
-                     # Wait, if `bestBid` is None/0, it means NO ONE wants to buy Yes.
-                     # So you CANNOT Sell Yes (Buy No).
-                     # So cost to Buy No is effectively infinity or market doesn't exist.
-                     continue
-             except:
-                 continue
+                 implied_yes_price = float(market["bestBid"])
+             except (ValueError, TypeError):
+                 pass
          
          # Safety: If price to Buy No is > 0.995 (i.e. Yes Bid is < 0.005)
          if price_buy_no > 0.995:
@@ -322,7 +318,7 @@ def calculate_ev_for_event(event, forecast_max, forecast_min):
              
          ev_no = true_prob_no - price_buy_no
          
-         if ev_no > 0.10: 
+         if ev_no > config.EV_THRESHOLD_SHORT:
              short_recommendations.append({
                  "market_question": question,
                  "bucket": f"{bucket['min']} to {bucket['max']} {bucket['unit']}",

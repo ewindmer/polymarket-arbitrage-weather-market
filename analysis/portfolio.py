@@ -1,69 +1,85 @@
 import math
 import numpy as np
+from typing import Dict, List, Optional, Any, Tuple
+import logging
 
-def calculate_kelly_bet(ev, odds, bankroll_fraction=0.1):
+import config
+
+logger = logging.getLogger(__name__)
+
+def calculate_kelly_bet(probability: float, price: float, bankroll_fraction: float = 0.25) -> float:
     """
-    Simple Kelly Criterion.
-    f* = (bp - q) / b
-    where b = net odds received (b to 1), p = probability of winning, q = probability of losing.
+    Calculate Kelly Criterion fraction for binary bets.
     
-    For binary options:
-    Payout is 1. Price is C.
-    Profit if win = 1 - C.
-    Cost if lose = C.
-    b = (1 - C) / C
-    p = true_prob
-    q = 1 - p
+    For binary options where payout is 1.0 and cost is price:
+    - If you win: profit = 1.0 - price
+    - If you lose: loss = price
     
-    f* = ( ((1-C)/C * p) - q ) / ((1-C)/C)
-       = p - q / ((1-C)/C)
-       = p - (1-p) * C / (1-C)
-       ... simplified Kelly for binary: f = p/C - q/(1-C)? No.
-       
-    Actually standard formula: f = Edge / Odds.
-    Edge = p - C.
+    Kelly fraction: f = (p - price) / (1 - price)
+    where p = true probability of winning, price = cost to bet
+    
+    Args:
+        probability: True probability of winning (0.0 to 1.0)
+        price: Cost to place the bet (0.0 to 1.0)
+        bankroll_fraction: Fractional Kelly multiplier (default 0.25 for quarter Kelly)
+    
+    Returns:
+        Recommended fraction of bankroll to bet (0.0 to 1.0)
     """
-    # Safe impl
-    # f = (p(b+1) - 1) / b
-    # where b is 'odds' 
-    # payout = 1/price
-    # b = 1/price - 1
+    if price <= 0 or price >= 1:
+        return 0.0
     
-    # Example: Price 0.53, Prob 0.39.
-    # Cost = 0.53. Net Win = 0.47.
-    # b = 0.47 / 0.53 = 0.886
-    # p = 0.39.
-    # f = (0.39 * (0.886 + 1) - 1) / 0.886 ... wait, EV is negative here.
+    if probability <= 0 or probability >= 1:
+        return 0.0
     
-    # Our EV in arbitrage.py is per share.
-    # f = EV / (1 - Price) ? No.
+    # Kelly fraction: f = (p - price) / (1 - price)
+    # This maximizes log growth rate
+    kelly_full = (probability - price) / (1 - price)
     
-    # Kelly for binary bets:
-    # f = (p - price) / (1 - price) ... NO.
+    # Apply fractional Kelly for safety (default quarter Kelly)
+    kelly_fractional = max(0.0, kelly_full * bankroll_fraction)
     
-    # Correct Formula: f = p/price - (1-p)/(1-price) ... wait this is for maximizing log growth?
-    # Let's use Edge / Variance proxy or just (Prob * (Payout/Cost)) - 1...
-    
-    # Standard: f = (p * (b + 1) - 1) / b
-    # b is net odds. b = (1 - Price)/Price.
-    # b+1 = 1/Price.
-    # f = (p/Price - 1) / ((1-Price)/Price) = (p - Price) / (1 - Price)
-    
-    # Let's stick to partial Kelly (fraction) to be safe.
-    pass
+    # Cap at 100% of bankroll
+    return min(1.0, kelly_fractional)
 
 class PortfolioAnalyzer:
-    def __init__(self, forecast_mean, forecast_std=2.0):
+    def __init__(self, forecast_mean: float, forecast_std: float = config.FORECAST_STD_DEV_C):
+        """
+        Initialize portfolio analyzer with forecast parameters.
+        
+        Args:
+            forecast_mean: Forecasted temperature mean in Celsius
+            forecast_std: Standard deviation in Celsius
+        """
         self.mean = forecast_mean
         self.std = forecast_std
         
-    def simulate_portfolio(self, bets, samples=1000):
+    def simulate_portfolio(
+        self, 
+        bets: List[Dict[str, Any]], 
+        samples: int = config.PORTFOLIO_SAMPLES
+    ) -> Dict[str, float]:
         """
-        Simulate Profit/Loss across a range of temperatures.
-        bets: list of dicts with {'min_c', 'max_c', 'type'='LONG'|'SHORT', 'price', 'quantity'}
+        Simulate Profit/Loss across a range of temperatures using Monte Carlo.
+        
+        Args:
+            bets: List of bet dictionaries with keys:
+                - 'min_c': Minimum temperature in Celsius
+                - 'max_c': Maximum temperature in Celsius
+                - 'type': 'LONG' or 'SHORT'
+                - 'price': Cost of the bet
+            samples: Number of temperature samples for simulation
+            
+        Returns:
+            Dictionary with 'expected_pnl', 'prob_profit', 'min_pnl', 'max_pnl'
         """
-        # Define simulation range (Mean +/- 4 STD)
-        temps = np.linspace(self.mean - 4*self.std, self.mean + 4*self.std, samples)
+        # Define simulation range (Mean +/- N*STD)
+        std_mult = config.PORTFOLIO_STD_MULTIPLIER
+        temps = np.linspace(
+            self.mean - std_mult * self.std, 
+            self.mean + std_mult * self.std, 
+            samples
+        )
         
         # Calculate P(T) for each temp step
         # PDF of normal dist
@@ -119,10 +135,24 @@ class PortfolioAnalyzer:
             "max_pnl": max(pnl_dist)
         }
 
-    def recommend_short_portfolio(self, short_candidates):
+    def recommend_short_portfolio(
+        self, 
+        short_candidates: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
         """
-        Takes a list of 'Bet No' candidates.
-        Optimizes weights?
+        Analyze a portfolio of short (Bet NO) candidates.
+        
+        Args:
+            short_candidates: List of short bet dictionaries with keys:
+                - 'bucket': String description
+                - 'min_c': Minimum temperature in Celsius
+                - 'max_c': Maximum temperature in Celsius
+                - 'price': Cost to buy NO
+                - 'prob_win': True probability of winning
+                - 'ev': Expected value
+                
+        Returns:
+            Dictionary with portfolio analysis including allocations, or None if empty
         """
         # User goal: "Sure win".
         # We need to find the combination of shorts where the "Safe Zone" (where all win)
@@ -161,12 +191,9 @@ class PortfolioAnalyzer:
             p = s['prob_win']
             price = s['price'] # This is Cost to Buy NO
             
-            # Kelly Fraction
-            if (1-price) == 0: kelly = 0
-            else: kelly = (p - price) / (1 - price)
-            
-            # Scale down for safety (quarter Kelly)
-            kelly_safe = max(0, kelly * 0.25) 
+            # Use Kelly Criterion helper function
+            kelly_full = calculate_kelly_bet(p, price, bankroll_fraction=1.0)
+            kelly_safe = calculate_kelly_bet(p, price, bankroll_fraction=config.KELLY_FRACTION) 
             
             allocations.append({
                 "bucket": s['bucket'],
